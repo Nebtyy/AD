@@ -1,7 +1,7 @@
 <#===========================================================
  AD Ultimate Baseline Non-Invasive Scanner
- Version: Stable 1.1
- Author: Nebty (custom build)
+ Version: Stable 1.2
+ Author: Nebty
 
  NOTE:
   - NO exploitation
@@ -12,7 +12,7 @@
 [CmdletBinding()]
 param()
 
-# --- Подготовка модуля AD ---
+# --- Active Directory module ---
 Import-Module ActiveDirectory -ErrorAction SilentlyContinue
 
 if (-not (Get-Module ActiveDirectory -ErrorAction SilentlyContinue)) {
@@ -61,7 +61,7 @@ try {
     $dcs = Get-ADDomainController -Filter * -ErrorAction Stop
     foreach ($dc in $dcs) {
         try {
-            $spooler = Get-Service -ComputerName $dc.HostName -Name Spooler -ErrorAction SilentlyContinue
+            $spooler = Get-Service -ComputerName $dc.HostName -Name "Spooler" -ErrorAction SilentlyContinue
             if ($spooler -and $spooler.Status -eq "Running") {
                 Write-Host "[!] Spooler running on: $($dc.HostName)" -ForegroundColor Red
             } else {
@@ -80,7 +80,7 @@ try {
 # ===========================================================
 Banner "Network Authentication Risks"
 
-# NTLM
+# NTLM level
 try {
     $lsa = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -ErrorAction SilentlyContinue
     $ntlm = $lsa.LmCompatibilityLevel
@@ -133,6 +133,85 @@ try {
     }
 } catch {
     Write-Warning "Failed to read WPAD settings: $($_.Exception.Message)"
+}
+
+# ===========================================================
+# PETITPOTAM / NTLM RELAY SURFACE
+# ===========================================================
+Banner "PetitPotam / NTLM Relay Surface"
+
+# 1) Outgoing NTLM restriction (RestrictSendingNTLMTraffic)
+try {
+    $msv = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0" -ErrorAction SilentlyContinue
+    $restrictOut = $msv.RestrictSendingNTLMTraffic
+
+    Write-Host "RestrictSendingNTLMTraffic: $restrictOut"
+
+    if ($restrictOut -eq 2) {
+        Write-Host "[+] Outgoing NTLM is blocked to remote servers (PetitPotam-resistant)" -ForegroundColor Green
+    } elseif ($restrictOut -eq 1) {
+        Write-Host "[!] Outgoing NTLM allowed only to whitelist (review whitelist for safety)" -ForegroundColor Yellow
+    } else {
+        Write-Host "[!] Outgoing NTLM allowed to any host (NTLM relay / PetitPotam possible)" -ForegroundColor Red
+    }
+} catch {
+    Write-Warning "Failed to read RestrictSendingNTLMTraffic (cannot determine PetitPotam exposure): $($_.Exception.Message)"
+}
+
+# 2) LM hash storage (NoLMHash)
+try {
+    $lsa2 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -ErrorAction SilentlyContinue
+    $noLmHash = $lsa2.NoLMHash
+    Write-Host "NoLMHash: $noLmHash"
+
+    if ($noLmHash -eq 1) {
+        Write-Host "[+] LM hashes are not stored (safer against offline cracking)"
+    } else {
+        Write-Host "[!] LM hashes may be stored (weaker posture for any relay/credential theft)" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Warning "Failed to read NoLMHash setting: $($_.Exception.Message)"
+}
+
+# 3) NTLM minimum client security (NtlmMinClientSec)
+try {
+    $ntlmMin = $msv.NtlmMinClientSec
+    Write-Host "NtlmMinClientSec: $ntlmMin"
+    if (-not $ntlmMin -or $ntlmMin -eq 0) {
+        Write-Host "[!] NtlmMinClientSec not hardened (weak NTLM client protections)" -ForegroundColor Yellow
+    } else {
+        Write-Host "[+] NtlmMinClientSec set (NTLM client security options in effect)"
+    }
+} catch {
+    Write-Warning "Failed to read NtlmMinClientSec: $($_.Exception.Message)"
+}
+
+# 4) EFS service on Domain Controllers (PetitPotam path via EFSRPC)
+try {
+    if (-not $dcs) {
+        $dcs = Get-ADDomainController -Filter * -ErrorAction SilentlyContinue
+    }
+
+    if ($dcs) {
+        foreach ($dc in $dcs) {
+            try {
+                $efs = Get-Service -ComputerName $dc.HostName -Name "EFS" -ErrorAction SilentlyContinue
+                if ($efs -and $efs.Status -eq "Running") {
+                    Write-Host "[!] EFS service running on DC: $($dc.HostName) (PetitPotam path available if NTLM relay allowed)" -ForegroundColor Yellow
+                } elseif ($efs) {
+                    Write-Host "[+] EFS service not running or disabled on DC: $($dc.HostName)"
+                } else {
+                    Write-Host "[!] EFS service not found on DC: $($dc.HostName) (cannot assess EFSRPC exposure)" -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Warning "Failed to query EFS service on $($dc.HostName): $($_.Exception.Message)"
+            }
+        }
+    } else {
+        Write-Warning "No DC list available to assess EFS service for PetitPotam."
+    }
+} catch {
+    Write-Warning "Error while evaluating EFS service on DCs: $($_.Exception.Message)"
 }
 
 # ===========================================================
